@@ -107,7 +107,10 @@ class NeuroEmoDynamics(nn.Module):
         device = self.device
 
         # ===== Neuromodulation profiles =====
-        profile_vec = self.profile_embedding(profile_ids.to(device))
+        if profile_vec is not None:
+            profile_vec = profile_vec.to(device)
+        else:
+            profile_vec = self.profile_embedding(profile_ids.to(device))
         serotonin      = torch.sigmoid(self.neuromod_gates['serotonin'](profile_vec))        # (B,512)
         norepinephrine = 1.0 + torch.sigmoid(self.neuromod_gates['norepinephrine'](profile_vec))  # (B,256)
         dopamine       = torch.sigmoid(self.neuromod_gates['dopamine'](profile_vec))         # (B,1024)
@@ -219,7 +222,10 @@ class NeuroEmoDynamics(nn.Module):
         return " ".join(tokens)
 
     def get_self_reference_flag(self, token_tensor, id_to_word):
-        first_person_pronouns = {"i", "me", "my", "mine", "we", "us", "our", "ours"}
+        first_person_pronouns = {
+            "i", "me", "my", "mine", "myself",
+            "we", "us", "our", "ours", "ourselves",
+        }
         flags = []
         for sample in token_tensor:
             text = self.decode_tokens(sample, id_to_word)

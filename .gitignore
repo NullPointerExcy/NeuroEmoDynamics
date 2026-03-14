@@ -2,3 +2,6 @@ venv
 .idea
 *.iml
 *.html
+*.pyc
+src/dataset
+src/checkpoints/states/*.json
