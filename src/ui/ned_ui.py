@@ -28,11 +28,13 @@ from data.synthetic_data import generate_synthetic_data
 from utils.helper_functions import build_vocab
 from utils.perspective_transform import transform_perspective, detect_second_person
 from models.ollama_client import OllamaClient
+from models.llama_client import LlamaClient
+from models.state_projector import build_state_vector
 from safetensors.torch import load_file
 
-# Auto-save path (relative to this file → src/checkpoints/states/)
 _UI_DIR = os.path.dirname(os.path.abspath(__file__))
 AUTOSAVE_PATH = os.path.join(_UI_DIR, "..", "checkpoints", "states", "autosave.json")
+LLAMA_LORA_DIR = os.path.join(_UI_DIR, "..", "checkpoints", "llama_lora")
 
 
 def tokenize(text):
@@ -92,22 +94,41 @@ def load_vocab():
         raise RuntimeError(f"Failed to load dataset and build vocab: {e}")
 
 
-# ================= Ollama Worker (background thread) =================
-class OllamaWorker(QThread):
-    """Run Ollama chat in a background thread so the UI doesn't freeze."""
+# ================= Chat Worker (background thread) =================
+class ChatWorker(QThread):
+    """Run LLM chat in a background thread so the UI doesn't freeze.
+
+    Supports both OllamaClient (text system prompt) and LlamaClient (raw state vector).
+    """
     finished = pyqtSignal(str)   # response text
     error = pyqtSignal(str)      # error message
 
-    def __init__(self, client, user_message, system_prompt, history):
+    def __init__(self, client, user_message, history,
+                 system_prompt=None, state_vector=None,
+                 persona="a friend", user_facts=None, self_facts=None):
         super().__init__()
         self.client = client
         self.user_message = user_message
-        self.system_prompt = system_prompt
         self.history = history
+        self.system_prompt = system_prompt
+        self.state_vector = state_vector
+        self.persona = persona
+        self.user_facts = user_facts
+        self.self_facts = self_facts
 
     def run(self):
         try:
-            response = self.client.chat(self.user_message, self.system_prompt, self.history)
+            if isinstance(self.client, LlamaClient):
+                response = self.client.chat(
+                    self.user_message, self.state_vector, self.history,
+                    persona=self.persona,
+                    user_facts=self.user_facts,
+                    self_facts=self.self_facts,
+                )
+            else:
+                response = self.client.chat(
+                    self.user_message, self.system_prompt, self.history
+                )
             self.finished.emit(response)
         except Exception as e:
             self.error.emit(str(e))
@@ -147,8 +168,10 @@ class MainWindow(QWidget):
         self.esm = None
         self.figure_canvas = None
         self.ollama_client = None
+        self.llama_client = None
+        self._active_client = None  # points to whichever client is in use
         self.conversation_history = []  # [{"role": "user"/"assistant", "content": "..."}]
-        self._ollama_worker = None  # keep reference to prevent GC
+        self._chat_worker = None  # keep reference to prevent GC
         self._fact_worker = None
         self._message_count_since_extraction = 0
 
@@ -204,7 +227,7 @@ class MainWindow(QWidget):
 
         main_layout.addLayout(top_layout)
 
-        # ===== Ollama Chat Settings =====
+        # ===== Chat Settings =====
         chat_settings_layout = QHBoxLayout()
 
         self.chat_enabled_cb = QCheckBox("Chat")
@@ -212,10 +235,21 @@ class MainWindow(QWidget):
         self.chat_enabled_cb.setToolTip("Enable/disable LLM chat responses")
         chat_settings_layout.addWidget(self.chat_enabled_cb)
 
+        chat_settings_layout.addWidget(QLabel("Backend:"))
+        self.chat_backend_combo = QComboBox()
+        self.chat_backend_combo.addItems(["Llama-LoRA (Vektor)", "Ollama (Text-Prompt)"])
+        self.chat_backend_combo.setFixedWidth(180)
+        self.chat_backend_combo.setToolTip(
+            "Llama-LoRA: Roher Zustandsvektor direkt an Llama3\n"
+            "Ollama: Klassischer Text-System-Prompt"
+        )
+        self.chat_backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        chat_settings_layout.addWidget(self.chat_backend_combo)
+
         chat_settings_layout.addWidget(QLabel("Model:"))
         self.ollama_model_input = QLineEdit("llama3")
         self.ollama_model_input.setFixedWidth(120)
-        self.ollama_model_input.setToolTip("Ollama model name (e.g. llama3, mistral, gemma2)")
+        self.ollama_model_input.setToolTip("Ollama model name (only used for Ollama backend)")
         self.ollama_model_input.editingFinished.connect(self.on_ollama_model_changed)
         chat_settings_layout.addWidget(self.ollama_model_input)
 
@@ -224,9 +258,9 @@ class MainWindow(QWidget):
         self.persona_input.setToolTip("Who should the chatbot be? (e.g. 'a therapist', 'a sarcastic teenager')")
         chat_settings_layout.addWidget(self.persona_input)
 
-        self.ollama_status_label = QLabel("")
-        self.ollama_status_label.setFixedWidth(20)
-        chat_settings_layout.addWidget(self.ollama_status_label)
+        self.chat_status_label = QLabel("")
+        self.chat_status_label.setFixedWidth(20)
+        chat_settings_layout.addWidget(self.chat_status_label)
 
         main_layout.addLayout(chat_settings_layout)
 
@@ -373,33 +407,58 @@ class MainWindow(QWidget):
             '<i style="color: #888;">-- Long-term message memory cleared --</i>'
         )
 
+    def _on_backend_changed(self, index):
+        """Switch between Llama-LoRA and Ollama backends."""
+        self.ollama_model_input.setEnabled(index == 1)  # only for Ollama
+        self._update_chat_status()
+
     def on_ollama_model_changed(self):
         model_name = self.ollama_model_input.text().strip()
         if model_name:
             self.ollama_client = OllamaClient(model=model_name)
-            self._update_ollama_status()
+            self._update_chat_status()
 
-    def _update_ollama_status(self):
-        if self.ollama_client and self.ollama_client.is_available():
-            self.ollama_status_label.setText("\u2705")
-            self.ollama_status_label.setToolTip(
-                f"Connected to Ollama ({self.ollama_client.model})"
-            )
+    def _use_llama_lora(self):
+        """Check if we're in Llama-LoRA mode."""
+        return self.chat_backend_combo.currentIndex() == 0
+
+    def _update_chat_status(self):
+        if self._use_llama_lora():
+            if os.path.exists(os.path.join(LLAMA_LORA_DIR, "config.json")):
+                self.chat_status_label.setText("\u2705")
+                self.chat_status_label.setToolTip("Llama-LoRA checkpoint found")
+            else:
+                self.chat_status_label.setText("\u274c")
+                self.chat_status_label.setToolTip(
+                    "Llama-LoRA checkpoint not found. Run train_llama_lora.py first."
+                )
         else:
-            self.ollama_status_label.setText("\u274c")
-            self.ollama_status_label.setToolTip(
-                "Ollama not available. Run: ollama serve"
-            )
+            if self.ollama_client and self.ollama_client.is_available():
+                self.chat_status_label.setText("\u2705")
+                self.chat_status_label.setToolTip(
+                    f"Connected to Ollama ({self.ollama_client.model})"
+                )
+            else:
+                self.chat_status_label.setText("\u274c")
+                self.chat_status_label.setToolTip(
+                    "Ollama not available. Run: ollama serve"
+                )
 
-    def _init_ollama(self):
-        """Lazily initialize the Ollama client on first use."""
-        if self.ollama_client is None:
-            model_name = self.ollama_model_input.text().strip() or "llama3"
-            self.ollama_client = OllamaClient(model=model_name)
-            self._update_ollama_status()
+    def _init_chat_client(self):
+        """Lazily initialize the active chat client."""
+        if self._use_llama_lora():
+            if self.llama_client is None:
+                self.llama_client = LlamaClient(LLAMA_LORA_DIR)
+            self._active_client = self.llama_client
+        else:
+            if self.ollama_client is None:
+                model_name = self.ollama_model_input.text().strip() or "llama3"
+                self.ollama_client = OllamaClient(model=model_name)
+            self._active_client = self.ollama_client
+        self._update_chat_status()
 
-    def _on_ollama_response(self, response):
-        """Handle successful Ollama response (called from worker thread)."""
+    def _on_chat_response(self, response):
+        """Handle successful chat response (called from worker thread)."""
         self.conversation_history.append({
             "role": "assistant", "content": response, "timestamp": time.time()
         })
@@ -415,12 +474,12 @@ class MainWindow(QWidget):
 
         # Extract facts every 5 exchanges (background, non-blocking)
         self._message_count_since_extraction += 1
-        if self._message_count_since_extraction >= 5 and self.ollama_client:
+        if self._message_count_since_extraction >= 5 and self._active_client:
             self._message_count_since_extraction = 0
             existing_user = self.esm.user_facts if self.esm else []
             existing_self = self.esm.self_facts if self.esm else []
             self._fact_worker = FactExtractorWorker(
-                self.ollama_client, list(self.conversation_history),
+                self._active_client, list(self.conversation_history),
                 existing_user, existing_self,
             )
             self._fact_worker.finished.connect(self._on_facts_extracted)
@@ -434,8 +493,8 @@ class MainWindow(QWidget):
             if self_facts:
                 self.esm.self_facts = self_facts
 
-    def _on_ollama_error(self, error_msg):
-        """Handle Ollama error (called from worker thread)."""
+    def _on_chat_error(self, error_msg):
+        """Handle chat error (called from worker thread)."""
         self.chat_history.append(
             f'<i style="color: #aa4444;">  [Chat unavailable: {error_msg}]</i>'
         )
@@ -666,29 +725,55 @@ class MainWindow(QWidget):
 
             chat_on = self.chat_enabled_cb.isChecked()
             if chat_on and self.esm is not None:
-                self._init_ollama()
-                mood_summary = self.esm.get_mood_summary()
-                system_prompt = self.ollama_client.build_system_prompt(
-                    mood_summary=mood_summary,
-                    dominant_mood=mood,
-                    valence=valence,
-                    emotion=", ".join(predicted_emotions),
-                    habituation_factor=hab_factor,
-                    habituation_count=hab_count,
-                    valence_trend=self.esm.get_valence_trend(),
-                    persona=self.persona_input.text().strip() or "a friend",
-                    user_facts=self.esm.user_facts,
-                    self_facts=self.esm.self_facts,
-                    conversation_history=self.conversation_history,
-                )
+                self._init_chat_client()
+                persona = self.persona_input.text().strip() or "a friend"
                 self._set_input_enabled(False)
-                self._ollama_worker = OllamaWorker(
-                    self.ollama_client, input_text, system_prompt,
-                    self.conversation_history[:-1]  # exclude current user msg (added by client)
-                )
-                self._ollama_worker.finished.connect(self._on_ollama_response)
-                self._ollama_worker.error.connect(self._on_ollama_error)
-                self._ollama_worker.start()
+
+                if self._use_llama_lora():
+                    # Build raw state vector from SNN outputs
+                    state_vec = build_state_vector(
+                        emotional_state=self.esm.emotional_state,
+                        serotonin=serotonin,
+                        dopamine=dopamine,
+                        norepinephrine=norepinephrine,
+                        emotion_probs=probs,
+                        valence=valence,
+                        habituation_factor=hab_factor,
+                    ).squeeze(0)  # (267,)
+
+                    self._chat_worker = ChatWorker(
+                        self._active_client, input_text,
+                        self.conversation_history[:-1],
+                        state_vector=state_vec,
+                        persona=persona,
+                        user_facts=self.esm.user_facts,
+                        self_facts=self.esm.self_facts,
+                    )
+                else:
+                    # Fallback: classic Ollama text prompt
+                    mood_summary = self.esm.get_mood_summary()
+                    system_prompt = self.ollama_client.build_system_prompt(
+                        mood_summary=mood_summary,
+                        dominant_mood=mood,
+                        valence=valence,
+                        emotion=", ".join(predicted_emotions),
+                        habituation_factor=hab_factor,
+                        habituation_count=hab_count,
+                        valence_trend=self.esm.get_valence_trend(),
+                        persona=persona,
+                        user_facts=self.esm.user_facts,
+                        self_facts=self.esm.self_facts,
+                        conversation_history=self.conversation_history,
+                    )
+                    self._chat_worker = ChatWorker(
+                        self._active_client, input_text,
+                        self.conversation_history[:-1],
+                        system_prompt=system_prompt,
+                    )
+
+                self._chat_worker.finished.connect(self._on_chat_response)
+                self._chat_worker.error.connect(self._on_chat_error)
+                self._chat_worker.start()
             else:
                 self.chat_history.append("")  # spacer
 
@@ -716,9 +801,9 @@ class MainWindow(QWidget):
         if self.esm is not None:
             try:
                 # Final fact extraction (synchronous, blocking — OK on close)
-                if self.ollama_client and self.conversation_history:
+                if self._active_client and self.conversation_history:
                     try:
-                        user_facts, self_facts = self.ollama_client.extract_facts(
+                        user_facts, self_facts = self._active_client.extract_facts(
                             self.conversation_history,
                             self.esm.user_facts,
                             self.esm.self_facts,
