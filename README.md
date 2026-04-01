@@ -214,24 +214,23 @@ Based on the current emotional state, one of two backends generates a response:
 
 ## References
 
-This project uses the dataset **[emotion](https://huggingface.co/datasets/dair-ai/emotion)** from Hugging Face.
+This project uses the dataset **[facebook/empathetic_dialogues](https://huggingface.co/datasets/facebook/empathetic_dialogues)** from Hugging Face.
 
 ```bibtex
-@inproceedings{saravia-etal-2018-carer,
-  title = "{CARER}: Contextualized Affect Representations for Emotion Recognition",
-  author = "Saravia, Elvis  and
-    Liu, Hsien-Chi Toby  and
-    Huang, Yen-Hao  and
-    Wu, Junlin  and
-    Chen, Yi-Shin",
-  booktitle = "Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing",
-  month = oct # "-" # nov,
-  year = "2018",
-  address = "Brussels, Belgium",
-  publisher = "Association for Computational Linguistics",
-  url = "https://www.aclweb.org/anthology/D18-1404",
-  doi = "10.18653/v1/D18-1404",
-  pages = "3687--3697"
+@inproceedings{rashkin-etal-2019-towards,
+    title = "Towards Empathetic Open-domain Conversation Models: A New Benchmark and Dataset",
+    author = "Rashkin, Hannah  and
+      Smith, Eric Michael  and
+      Li, Margaret  and
+      Boureau, Y-Lan",
+    booktitle = "Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics",
+    month = jul,
+    year = "2019",
+    address = "Florence, Italy",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/P19-1534",
+    doi = "10.18653/v1/P19-1534",
+    pages = "5370--5381",
 }
 ```
 
